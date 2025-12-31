@@ -34,6 +34,49 @@ void db_check_coin_symbol(YAAMP_DB *db, char* symbol)
 	}
 }
 
+// Return coin id for a given coin symbol (must be installed)
+static int db_get_coinid_by_symbol(YAAMP_DB *db, const char* symbol)
+{
+	if(!db || !symbol || !symbol[0]) return 0;
+	// installed coins only (same rule as db_check_coin_symbol when g_autoexchange is off)
+	if (!g_autoexchange)
+		db_query(db, "SELECT id FROM coins WHERE installed AND algo='%s' AND symbol='%s' LIMIT 1", g_stratum_algo, symbol);
+	else
+		db_query(db, "SELECT id FROM coins WHERE installed AND (symbol='%s' OR symbol2='%s') LIMIT 1", symbol, symbol);
+
+	MYSQL_RES *result = mysql_store_result(&db->mysql);
+	if(!result) return 0;
+	MYSQL_ROW row = mysql_fetch_row(result);
+	int id = (row && row[0]) ? atoi(row[0]) : 0;
+	mysql_free_result(result);
+	return id;
+}
+
+static void db_set_account_wallet(YAAMP_DB *db, int account_id, const char* symbol_in, const char* address_in)
+{
+	if(!db || account_id <= 0 || !symbol_in || !symbol_in[0] || !address_in || !address_in[0]) return;
+
+	char symbol[16] = {0};
+	char address[128] = {0};
+	strncpy(symbol, symbol_in, sizeof(symbol)-1);
+	strncpy(address, address_in, sizeof(address)-1);
+
+	// basic sanitization (sql injection guard)
+	db_check_user_input(symbol);
+	db_check_user_input(address);
+
+	int coinid = db_get_coinid_by_symbol(db, symbol);
+	if(!coinid) return;
+
+	// account_wallets table must exist on the frontend DB
+	// unique key on (account_id, coinid) is expected
+	db_query(db,
+		"INSERT INTO account_wallets (account_id, coinid, address, created, updated) "
+		"VALUES (%d, %d, '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP()) "
+		"ON DUPLICATE KEY UPDATE address=VALUES(address), updated=VALUES(updated)",
+		account_id, coinid, address);
+}
+
 void db_add_user(YAAMP_DB *db, YAAMP_CLIENT *client)
 {
 	db_clean_string(db, client->username);
@@ -74,6 +117,23 @@ void db_add_user(YAAMP_DB *db, YAAMP_CLIENT *client)
 			// set list of specific coins to skip in selection
 			else if (command.at(0) == "nc") {
 				string_tokenize(command.at(1), '/', client->coins_ignore_list);
+			}
+			// Secondary payout address for merged mining / multi-coin payouts
+			//  - da=<DOGE_ADDRESS>  (shortcut for DOGE)
+			//  - aw=SYMBOL:ADDRESS/SYMBOL:ADDRESS
+			else if (command.at(0) == "da") {
+				client->payout_addresses.push_back(std::make_pair(std::string("DOGE"), command.at(1)));
+			}
+			else if (command.at(0) == "aw") {
+				std::vector<std::string> parts;
+				string_tokenize(command.at(1), '/', parts);
+				for(auto &p: parts) {
+					std::vector<std::string> kv;
+					string_tokenize(p, ':', kv);
+					if(kv.size() == 2) {
+						client->payout_addresses.push_back(std::make_pair(kv.at(0), kv.at(1)));
+					}
+				}
 			}
 #ifdef ALLOW_CUSTOM_DONATIONS
 			else if (command.at(0) == "g") {
@@ -149,6 +209,18 @@ void db_add_user(YAAMP_DB *db, YAAMP_CLIENT *client)
 		if (mysql_affected_rows(&db->mysql) > 0 && (symbol.size() > 0)) {
 			debuglog("%s: %s coinsymbol set to %s ip %s uid (%d)\n",
 				g_current_algo->name, client->username, symbol.substr(0,15).c_str(), client->sock->ip, client->userid);
+		}
+	}
+
+	// Save optional per-coin payout addresses (account_wallets)
+	if(client->userid > 0 && !client->payout_addresses.empty()) {
+		for(auto &it: client->payout_addresses) {
+			// limit size, prevent abuse
+			std::string sym = it.first.substr(0, 12);
+			std::string addr = it.second.substr(0, 120);
+			// upper-case symbol
+			for (auto &c : sym) c = toupper(c);
+			db_set_account_wallet(db, client->userid, sym.c_str(), addr.c_str());
 		}
 	}
 }

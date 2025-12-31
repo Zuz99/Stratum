@@ -71,6 +71,10 @@ public:
 	std::vector<std::string> coins_mining_list;
 	std::vector<std::string> coins_ignore_list;
 
+	// Optional per-coin payout addresses (for merged mining / multi-coin payouts)
+	// Example password: "c=LTC,da=DH5..." or "aw=DOGE:DH5.../LTC:ltc1..."
+	std::vector<std::pair<std::string,std::string>> payout_addresses;
+
 	double difficulty_actual;
 	double difficulty_remote;
 	double difficulty_written;
